@@ -28,12 +28,26 @@ from torch import nn
 import os
 
 from transformers.activations import ACT2FN
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from modeling_llama_kv import LlamaForCausalLM
 from configs import EConfig
-from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
+
+
+def get_tokens(tokenizer, messages):
+    tokens = tokenizer.apply_chat_template(
+        messages,
+        add_special_tokens=False,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    if isinstance(tokens, list) and isinstance(tokens[0], list):
+        tokens = tokens[0]
+    if tokens[0] == tokenizer.bos_token_id:
+        tokens = tokens[1:]
+    return tokens
+
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -99,7 +113,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim, max_position_embeddings=8192, base=10000, device=None):
         super().__init__()
 
         self.dim = dim
@@ -137,7 +151,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(self, dim, max_position_embeddings=8192, base=10000, device=None, scaling_factor=1.0):
         self.scaling_factor = scaling_factor
         super().__init__(dim, max_position_embeddings, base, device)
 
@@ -156,7 +170,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
 class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(self, dim, max_position_embeddings=8192, base=10000, device=None, scaling_factor=1.0):
         self.scaling_factor = scaling_factor
         super().__init__(dim, max_position_embeddings, base, device)
 
@@ -447,15 +461,12 @@ def padding(tensor, left=True):
 def process_data(data_chunk):
 
     token_dict = Counter()
-    input_ids = data_chunk["input_ids"]
-    loss_mask = data_chunk["loss_mask"]
-    for i in range(len(input_ids)):
-        ids= input_ids[i][0]
-        mask = loss_mask[i][0]
+    for r in data_chunk:
+        ids = r["input_ids"]
+        mask = r["loss_mask"]
         for j in range(len(ids)):
             if mask[j] == 1:
                 token_dict[ids[j]] += 1
-
     return token_dict
 
 
@@ -478,7 +489,7 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -523,7 +534,7 @@ class Model(nn.Module):
             dataset = dataset['train']
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
-            num_proc = 48
+            num_proc = 8
 
 
             def preprocess_function(examples):
@@ -532,86 +543,45 @@ class Model(nn.Module):
                     "input_ids": [],
                     "loss_mask": []
                 }
-                for i in range(len(examples['id'])):
-                    messages = [
-                        {"role": "system",
-                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-                    ]
-                    convroles = ["user", "assistant"]
-                    roles = {"human": "user", "gpt": "assistant"}
-                    source = examples['conversations'][i]
-                    if not source:
-                        continue
-                    if roles[source[0]["from"]] != "user":
-                        # Skip the first one if it is not from human
-                        source = source[1:]
-                    for j, sentence in enumerate(source):
-                        role = roles[sentence["from"]]
-                        assert role == convroles[j % 2], f"{i}"
-                        # if sentence["from"]=="gpt":
-                        #     sentence["value"]=" "+sentence["value"]
-                        messages.append(
-                            {"role": role, "content": sentence["value"]}
-                        )
-                    conversation = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=False,
-                    )
-
-                    if not tokenizer.pad_token_id:
-                        tokenizer.pad_token_id = tokenizer.unk_token_id
-
-                    input_ids = tokenizer(
-                        conversation,
-                        return_tensors="pt",
-                        max_length=2048,
-                        add_special_tokens=False,
-                    ).input_ids[0]
-                    loss_mask = torch.ones_like(input_ids)
-                    # print(i)
-
-                    sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-                    total_len = len(input_ids)
-
-                    sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-                    turns = conversation.split(sep2)
-
-                    turns[1] = turns[0] + sep2 + turns[1]
-                    turns = turns[1:]
-
-                    cur_len = 1
-                    loss_mask[:cur_len] = 0
-                    for i, turn in enumerate(turns):
-                        if turn == "":
+                max_tokens_count = 3072
+                for i in range(len(examples["messages"])):
+                    messages = examples['messages'][i]
+                    input_ids, labels = [], []
+                    for message in messages:
+                        message_input_ids = get_tokens(tokenizer, [message])
+                        message_labels = message_input_ids
+                        if len(input_ids) + len(message_input_ids) > max_tokens_count - 2:
                             break
-                        turn_len = len(tokenizer(turn).input_ids)
 
-                        parts = turn.split(sep)
-                        if len(parts) != 2:
-                            break
-                        parts[0] += sep
-                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+                        labels_mask = [-100 for _ in range(len(message_input_ids))]
+                        if message["role"] not in ("assistant", "bot", "gpt"):
+                            message_labels = labels_mask
 
-                        # Ignore the user instructions
-                        if i == 0:
-                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                        else:
-                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                        cur_len += turn_len
-                        if i != 0:
-                            cur_len += 3
-                        # cur_len+=2
+                        input_ids.extend(message_input_ids)
+                        labels.extend(message_labels)
 
-                        # if i != 0 and not tokenizer.legacy:
-                        #     # The legacy and non-legacy modes handle special tokens differently
-                        #     cur_len -= 1
+                    original_input_ids = get_tokens(tokenizer, messages)
+                    assert input_ids == original_input_ids[: len(input_ids)], f"{input_ids} vs {original_input_ids}"
 
-                    loss_mask[cur_len:] = 0
+                    if input_ids[0] != tokenizer.bos_token_id:
+                        input_ids.insert(0, tokenizer.bos_token_id)
+                        labels.insert(0, -100)
 
-                    # new_examples["conversation"].append(conversation)
+                    if input_ids[-2] == tokenizer.eos_token_id:
+                        input_ids = input_ids[:-1]
+                        labels = labels[:-1]
+
+                    if input_ids[-1] != tokenizer.eos_token_id:
+                        input_ids.append(tokenizer.eos_token_id)
+                        labels.append(tokenizer.eos_token_id)
+
+                    input_ids = torch.LongTensor(input_ids)
+                    labels = torch.LongTensor(labels)
+                    neg100_positions = torch.where(labels == -100)[0]
+                    rightmost_neg100 = neg100_positions[-1]
+                    loss_mask = torch.zeros_like(labels)
+                    loss_mask[rightmost_neg100 + 1:] = 1
+                    attention_mask = input_ids.new_ones(input_ids.size())
                     new_examples["input_ids"].append(input_ids[None, :])
                     new_examples["loss_mask"].append(loss_mask[None, :])
 
@@ -625,17 +595,14 @@ class Model(nn.Module):
                 load_from_cache_file=False
             )
             #dataset.set_format(type="torch")
+            records = [{"input_ids": i[0], "loss_mask": l[0]} for i, l in zip(dataset["input_ids"], dataset["loss_mask"])]
 
 
 
-            num_processes = num_proc
-            chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
-            chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
-
-            # 创建进程池
-            with multiprocessing.Pool(num_processes) as pool:
-                # 并行处理数据块
-                results = pool.map(process_data, chunks)
+            num_processes = 8
+            chunk_size = len(records) // num_processes + (len(records) % num_processes > 0)
+            chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
+            results = [process_data(chunk) for chunk in chunks]
 
             # 合并结果
             token_dict = merge_dicts(results)
@@ -648,10 +615,12 @@ class Model(nn.Module):
             print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
             used_tokens = [key for key, freq in top_N]
             used_tokens.sort()
+            assert len(used_tokens) == N
             d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
             t2d = [i in used_tokens for i in range(self.vocab_size)]
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
+            assert sum(t2d) == N
             cache = {
                 "d2t": d2t,
                 "t2d": t2d
@@ -691,7 +660,7 @@ class Model(nn.Module):
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
-        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
+        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]

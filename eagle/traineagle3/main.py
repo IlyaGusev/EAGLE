@@ -21,10 +21,11 @@ train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
     "num_epochs": 40,
     "num_workers": 2,
-    "max_len": 2048,
+    "max_len": 8192,
     "config_path": "config.json",
 }
 
+from deepspeed.accelerator import get_accelerator
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
@@ -49,12 +50,22 @@ from tqdm import tqdm
 import numpy as np
 from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 
-
+def get_tokens(tokenizer, messages):
+    tokens = tokenizer.apply_chat_template(
+        messages,
+        add_special_tokens=False,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    if isinstance(tokens, list) and isinstance(tokens[0], list):
+        tokens = tokens[0]
+    if tokens[0] == tokenizer.bos_token_id:
+        tokens = tokens[1:]
+    return tokens
 
 def build_dataset_rank(
         tokenizer, datapath
 ):
-
     ds = load_dataset('json', data_files=datapath)
     ds = ds['train']
     ds = ds.shuffle(seed=42)
@@ -68,87 +79,45 @@ def build_dataset_rank(
             "input_ids": [],
             "loss_mask": []
         }
-        for i in range(len(examples['id'])):
-            messages = [
-                {"role": "system",
-                 "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            ]
-            convroles = ["user", "assistant"]
-            roles = {"human": "user", "gpt": "assistant"}
-            source = examples['conversations'][i]
-            if not source:
-                continue
-            if roles[source[0]["from"]] != "user":
-                # Skip the first one if it is not from human
-                source = source[1:]
-            for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
-                assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
-                messages.append(
-                    {"role": role, "content": sentence["value"]}
-                )
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-            if not tokenizer.pad_token_id:
-                tokenizer.pad_token_id = tokenizer.unk_token_id
-
-            input_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                max_length=2048,
-                add_special_tokens=False,
-            ).input_ids[0]
-            loss_mask = torch.ones_like(input_ids)
-            # print(i)
-
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-            total_len = len(input_ids)
-
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            turns = conversation.split(sep2)
-
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
+        max_tokens_count = 3072
+        for i in range(len(examples["messages"])):
+            messages = examples['messages'][i]
+            input_ids, labels = [], []
+            for message in messages:
+                message_input_ids = get_tokens(tokenizer, [message])
+                message_labels = message_input_ids
+                if len(input_ids) + len(message_input_ids) > max_tokens_count - 2:
                     break
-                turn_len = len(tokenizer(turn).input_ids)
 
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+                labels_mask = [-100 for _ in range(len(message_input_ids))]
+                if message["role"] not in ("assistant", "bot", "gpt"):
+                    message_labels = labels_mask
 
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                # cur_len+=2
+                input_ids.extend(message_input_ids)
+                labels.extend(message_labels)
 
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
+            original_input_ids = get_tokens(tokenizer, messages)
+            assert input_ids == original_input_ids[: len(input_ids)], f"{input_ids} vs {original_input_ids}"
 
-            loss_mask[cur_len:] = 0
-            attention_mask = torch.ones_like(loss_mask)
+            if input_ids[0] != tokenizer.bos_token_id:
+                input_ids.insert(0, tokenizer.bos_token_id)
+                labels.insert(0, -100)
 
-            # new_examples["conversation"].append(conversation)
+            if input_ids[-2] == tokenizer.eos_token_id:
+                input_ids = input_ids[:-1]
+                labels = labels[:-1]
+
+            if input_ids[-1] != tokenizer.eos_token_id:
+                input_ids.append(tokenizer.eos_token_id)
+                labels.append(tokenizer.eos_token_id)
+
+            input_ids = torch.LongTensor(input_ids)
+            labels = torch.LongTensor(labels)
+            neg100_positions = torch.where(labels == -100)[0]
+            rightmost_neg100 = neg100_positions[-1]
+            loss_mask = torch.zeros_like(labels)
+            loss_mask[rightmost_neg100 + 1:] = 1
+            attention_mask = input_ids.new_ones(input_ids.size())
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
             new_examples["attention_mask"].append(attention_mask[None, :])
@@ -223,17 +192,16 @@ world_size = deepspeed.comm.get_world_size()
 if global_rank == 0:
     import wandb
 
-    wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+    wandb.init(project="eagle3",config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
 sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
+test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=0, pin_memory=True,
                          collate_fn=DataCollatorWithPadding())
 
 train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
+train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=0,
                           pin_memory=True,
                           collate_fn=DataCollatorWithPadding())
 
@@ -295,6 +263,8 @@ for epoch in range(start_epoch, num_epochs):
             wandb.log(logdict)
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
+
+        get_accelerator().empty_cache()
 
 
     for i in range(len(epoch_acces)):
