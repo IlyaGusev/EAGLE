@@ -19,7 +19,7 @@ with open(deepspeed_config) as f:
     ds_config = json.load(f)
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
+    "num_epochs": 5,
     "num_workers": 2,
     "max_len": 8192,
     "config_path": "config.json",
@@ -71,7 +71,7 @@ def build_dataset_rank(
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 1
 
     def preprocess_function(examples):
         new_examples = {
@@ -79,7 +79,7 @@ def build_dataset_rank(
             "input_ids": [],
             "loss_mask": []
         }
-        max_tokens_count = 3072
+        max_tokens_count = 4096
         for i in range(len(examples["messages"])):
             messages = examples['messages'][i]
             input_ids, labels = [], []

@@ -489,7 +489,7 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -543,7 +543,7 @@ class Model(nn.Module):
                     "input_ids": [],
                     "loss_mask": []
                 }
-                max_tokens_count = 3072
+                max_tokens_count = 4096
                 for i in range(len(examples["messages"])):
                     messages = examples['messages'][i]
                     input_ids, labels = [], []
@@ -585,6 +585,7 @@ class Model(nn.Module):
                     new_examples["input_ids"].append(input_ids[None, :])
                     new_examples["loss_mask"].append(loss_mask[None, :])
 
+
                 return new_examples
 
             dataset = dataset.map(
@@ -596,8 +597,6 @@ class Model(nn.Module):
             )
             #dataset.set_format(type="torch")
             records = [{"input_ids": i[0], "loss_mask": l[0]} for i, l in zip(dataset["input_ids"], dataset["loss_mask"])]
-
-
 
             num_processes = 8
             chunk_size = len(records) // num_processes + (len(records) % num_processes > 0)
