@@ -1,11 +1,25 @@
 import argparse
+import os
+
+def list_local_files(path, suffixes=[".ckpt"]):
+    datapaths = []
+    for root, directories, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            datapaths.append(file_path)
+
+    # Filter out files that don't end with the suffixes (ie. when there's a HuggingFace .cache folder)
+    for suffix in suffixes:
+        datapaths = [f_name for f_name in datapaths if f_name.endswith(suffix)]
+
+    return datapaths
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--lr', type=float, default=3e-5)
-parser.add_argument('--bs', type=int, default=4)
-parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
+parser.add_argument('--bs', type=int, default=1)
+parser.add_argument('--gradient-accumulation-steps', type=int, default=4)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
 args = parser.parse_args()
@@ -31,7 +45,7 @@ train_config = {
     "mean": 0.0,
     "std": 0.2,
     "residual": "true,norm",
-    "max_len": 2048,
+    "max_len": 8192,
     # During training, truncating the training sequences means that the larger the setting, the more training data is used, and the better the effect, but it also consumes more VRAM.
     "config_path": args.configpath,
     "b1": 0.9,
@@ -67,7 +81,7 @@ from transformers import get_linear_schedule_with_warmup, AutoConfig
 if accelerator.is_main_process:
     import wandb
 
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
+    wandb.init(project="eagle", config=train_config)
 
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
@@ -132,24 +146,33 @@ class AddUniformNoise:
 
 
 class CustomDataset(Dataset):
-    def __init__(self, datapath, transform=None):
-        self.data = datapath
+    def __init__(self, datapath, transform=None, max_len=8192):
+        self.datapaths = datapath
         self.transform = transform
+        self._epoch = 0
+        self.max_len = max_len
 
     def __len__(self):
-        return len(self.data)
+        return len(self.datapaths)
+
+    def _open_file(self, index):
+        return torch.load(self.datapaths[index], weights_only=False)
 
     def __getitem__(self, index):
-        # try:
-        data = torch.load(self.data[index])
+        try:
+            data = self._open_file(index)
+        except Exception as e:
+            print(f"Failed to load {self.datapaths[index]} with error {e}")
+            raise e
         new_data = {}
-        hidden_state = data['hidden_state'][:train_config["max_len"]][None, :]
-        input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
 
+        # Squeeze due to our data generation script adding a batch dimension
+        hidden_state = data["hidden_state"].squeeze(0)[: self.max_len][None, :]
+
+        input_ids = data["input_ids"][: self.max_len][None, :]
+        loss_mask = data["loss_mask"][: self.max_len][None, :]
 
         length = hidden_state.shape[1]
-        # length_q = data['query_ids'].shape[1]
         attention_mask = [1] * length
         loss_mask = loss_mask[0].tolist()
         loss_mask[-1] = 0
@@ -168,11 +191,13 @@ class CustomDataset(Dataset):
         new_data["hidden_state_big"] = hidden_state
         new_data["input_ids"] = input_ids_target
 
-
         if self.transform:
             new_data = self.transform(new_data)
 
         return new_data
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
 
 
 class DataCollatorWithPadding:
@@ -301,17 +326,19 @@ if train_config["data_noise"]:
 else:
     aug = None
 
-datapath = list_files(train_config["datapath"])
 
-traindatapath = datapath[:int(len(datapath) * 0.95)]
-testdatapath = datapath[int(len(datapath) * 0.95):]
+train_data_paths = list_local_files("../saiga/eagle_train")
+eval_data_paths = list_local_files("../saiga/eagle_val")
 
-traindataset = CustomDataset(traindatapath, transform=aug)
-testdataset = CustomDataset(testdatapath)
-train_loader = DataLoader(traindataset, batch_size=train_config["bs"], shuffle=True,
+eagle_train_dataset = CustomDataset(
+    train_data_paths, transform=AddUniformNoise(std=0.5)
+)
+eagle_test_dataset = CustomDataset(eval_data_paths)
+
+train_loader = DataLoader(eagle_train_dataset, batch_size=train_config["bs"], shuffle=True,
                           collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"],
                           pin_memory=True)
-test_loader = DataLoader(testdataset, batch_size=train_config["bs"], shuffle=False,
+test_loader = DataLoader(eagle_test_dataset, batch_size=train_config["bs"], shuffle=False,
                          collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True)
 
 if accelerator.is_main_process:
